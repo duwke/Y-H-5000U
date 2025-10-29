@@ -29,7 +29,6 @@ Based on SRNE Modbus RTU protocol
 | `batterySOC` | int | Read | - |
 | `loadPower` | CloudPower | Read | - |
 | `pvPower` | CloudPower | Read | - |
-| `enableBuzzer` | bool | Read & Write | `onEnableBuzzerChange` |
 | `takeSnapshot` | bool | Read & Write | `onTakeSnapshotChange` |
 | `compareSnapshot` | bool | Read & Write | `onCompareSnapshotChange` |
 
