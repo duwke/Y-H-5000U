@@ -1,0 +1,153 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Arduino: Compile",
+      "type": "shell",
+      "command": "arduino-cli",
+      "args": [
+        "compile",
+        "--fqbn",
+        "arduino:renesas_uno:unor4wifi",
+        "--output-dir",
+        "${workspaceFolder}/build",
+        "${workspaceFolder}"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Arduino: Upload (USB)",
+      "type": "shell",
+      "command": "arduino-cli",
+      "args": [
+        "upload",
+        "-p",
+        "${input:serialPort}",
+        "--fqbn",
+        "arduino:renesas_uno:unor4wifi",
+        "${workspaceFolder}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Arduino Cloud: Deploy OTA (Bash)",
+      "type": "shell",
+      "command": "${workspaceFolder}/deploy.sh",
+      "args": [
+        "${input:deviceId}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Arduino Cloud: Deploy OTA (Python)",
+      "type": "shell",
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/deploy.py",
+        "${input:deviceId}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Arduino Cloud: List Devices",
+      "type": "shell",
+      "command": "arduino-cloud-cli",
+      "args": [
+        "device",
+        "list"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Arduino Cloud: Check OTA Status",
+      "type": "shell",
+      "command": "arduino-cloud-cli",
+      "args": [
+        "ota",
+        "status",
+        "--device-id",
+        "${input:deviceId}"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Arduino: Serial Monitor",
+      "type": "shell",
+      "command": "arduino-cli",
+      "args": [
+        "monitor",
+        "-p",
+        "${input:serialPort}",
+        "-c",
+        "baudrate=115200"
+      ],
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Arduino: List Boards",
+      "type": "shell",
+      "command": "arduino-cli",
+      "args": [
+        "board",
+        "list"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "deviceId",
+      "type": "promptString",
+      "description": "Arduino IoT Cloud Device ID",
+      "default": ""
+    },
+    {
+      "id": "serialPort",
+      "type": "promptString",
+      "description": "Serial port (e.g., /dev/ttyACM0)",
+      "default": "/dev/ttyACM0"
+    }
+  ]
+}

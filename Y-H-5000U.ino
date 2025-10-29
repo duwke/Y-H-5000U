@@ -19,18 +19,42 @@
  * - pvCurrent (CloudElectricCurrent, Read)
  * - batteryVoltage (CloudElectricPotential, Read)
  * - pvVoltage (CloudElectricPotential, Read)
- * - batterySOC (int, Read)
  * - loadPower (CloudPower, Read)
  * - pvPower (CloudPower, Read)
- * - enableBuzzer (bool, Read & Write) - callback: onEnableBuzzerChange
  * - takeSnapshot (bool, Read & Write) - callback: onTakeSnapshotChange
  * - compareSnapshot (bool, Read & Write) - callback: onCompareSnapshotChange
  * 
  * Control everything via Arduino IoT Cloud dashboard!
  */
 
+
 #include <Arduino.h>
 #include "thingProperties.h"
+#include <WiFiS3.h>
+
+// Web server on port 80
+WiFiServer server(80);
+
+// Circular buffer for logs
+#define MAX_LOG_ENTRIES 100
+String logBuffer[MAX_LOG_ENTRIES];
+int logIndex = 0;
+int logCount = 0;
+
+void logToWeb(String message) {
+  // Add timestamp
+  String timestampedMsg = String(millis()/1000) + "s: " + message;
+
+  // Store in circular buffer
+  logBuffer[logIndex] = timestampedMsg;
+  logIndex = (logIndex + 1) % MAX_LOG_ENTRIES;
+  if (logCount < MAX_LOG_ENTRIES) {
+    logCount++;
+  }
+
+  // Also print to Serial
+  Serial.println(timestampedMsg);
+}
 
 // Modbus configuration
 #define SLAVE_ID 1                 // Y&H uses slave ID 1 (confirmed working)
@@ -62,13 +86,13 @@ struct InverterData {
   float loadPower;
   float acInputVoltage;
   float acOutputVoltage;
-  int batterySOC;
   uint16_t inverterStatus;
   bool valid;
 };
 
 InverterData inverterData;
 unsigned long lastPoll = 0;
+bool deviceIPSet = false;  // Flag to track if deviceIP has been set
 
 // Response buffer for parsing
 uint8_t responseBuffer[256];
@@ -104,6 +128,9 @@ int currentRegisterIndex = 0;
 unsigned long lastScanTime = 0;
 #define SCAN_INTERVAL 150  // ms between register reads during scan
 
+// Buffer for batching register discoveries before sending to webhook
+String registerLogBuffer = "";
+
 // Scan ranges based on what we know works on Y&H HSI 5000U
 struct ScanRange {
   uint16_t start;
@@ -127,6 +154,7 @@ uint16_t calculateCRC(uint8_t* data, uint8_t length);
 bool writeModbusRegister(uint16_t address, uint16_t value);
 bool readModbusRegisters(uint16_t startAddress, uint16_t numRegisters);
 int readSingleRegister(uint16_t address);
+void queryDeviceIdentification();
 void parseInverterData();
 void decodeBatteryBlock();
 void decodeLoadBlock();
@@ -137,6 +165,7 @@ void processScanStep();
 void onEnableBuzzerChange();
 void onTakeSnapshotChange();
 void onCompareSnapshotChange();
+void handleWebServer();
 
 void setup() {
   // Initialize serial and wait for port to open:
@@ -144,34 +173,85 @@ void setup() {
   // This delay gives the chance to wait for a Serial Monitor without blocking if none is found
   delay(1500);
   
+  pinMode(A0, INPUT);  
+
   // Defined in thingProperties.h
   initProperties();
-  
+
   // Connect to Arduino IoT Cloud
   ArduinoCloud.begin(ArduinoIoTPreferredConnection);
   
   /*
      The following function allows you to obtain more information
      related to the state of network and IoT Cloud connection and errors
-     the higher number the more granular information you'll get.
+     the higher number the more granular information you’ll get.
      The default is 0 (only errors).
      Maximum is 4
-  */
+ */
   setDebugMessageLevel(2);
   ArduinoCloud.printDebugInfo();
-  
+
   Serial.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   Serial.println("Y&H HSI 5000U Monitor v2.0");
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   Serial.println("Modbus RTU @ 9600 baud, Slave ID 1");
   Serial.println("Control via Arduino IoT Cloud");
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-  
+
+  // Wait for Arduino Cloud connection before using webhook
+  Serial.print("Waiting for Arduino Cloud connection");
+  int cloudAttempts = 0;
+  while (ArduinoCloud.connected() == 0 && cloudAttempts < 60) {
+    ArduinoCloud.update();  // Process connection
+    delay(500);
+    Serial.print(".");
+    cloudAttempts++;
+  }
+
+  if (ArduinoCloud.connected()) {
+    Serial.println("\n✅ Arduino Cloud connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+    // Start web server
+    server.begin();
+    Serial.println("✅ Web server started on port 80");
+    Serial.print("📊 View logs at: http://");
+    Serial.println(WiFi.localIP());
+
+    logToWeb("Y&H HSI 5000U Monitor v2.0 - Starting up");
+  } else {
+    Serial.println("\n⚠️  Arduino Cloud not connected, web server disabled");
+  }
+
   // Modbus communication on Serial1
   Serial1.begin(MODBUS_BAUD, SERIAL_8N1);
-  
+
   delay(1000);  // Give inverter time to stabilize
+
+  // Query device identification on startup
+  queryDeviceIdentification();
 }
+
+// Measure current with ACS712
+// and print on Serial Monitor
+const int nSamples = 20;
+const float vcc = -12.0;
+const int adcMax = 1023;
+
+//const float sens = 0.185;  // 5A
+//const float sens = 0.100;  // 20A
+const float sens = 0.66;  // 30A
+
+float avg() {
+  float val = 0;
+  for (int i = 0; i < nSamples; i++) {
+    val += analogRead(A0);
+    delay(1);
+  }
+  return val / adcMax / nSamples;
+}
+
 
 // Swap bytes for little-endian data (PowMr/SRNE format)
 uint16_t swapBytes(uint16_t value) {
@@ -433,17 +513,269 @@ int readSingleRegister(uint16_t address) {
   if (!readModbusRegisters(address, 1)) {
     return -1;  // Error
   }
-  
+
   if (responseBytesRead >= 7) {
     uint16_t value = (responseBuffer[3] << 8) | responseBuffer[4];
     return value;
   }
-  
+
   return -1;
+}
+
+// Query Modbus Device Identification (Function Code 43)
+void queryDeviceIdentification() {
+  String logMsg = "\n========================================\n";
+  logMsg += "🔍 QUERYING MODBUS DEVICE IDENTIFICATION\n";
+  logMsg += "========================================\n";
+  logMsg += "Attempting Modbus Function Code 43 (0x2B)\n";
+  logMsg += "MEI Type: Read Device Identification (0x0E)\n\n";
+
+  Serial.print(logMsg);
+  logToWeb(logMsg);
+
+  // Try reading Basic Device Identification (Read Device ID Code = 01)
+  uint8_t request[8];
+  request[0] = SLAVE_ID;           // Slave address
+  request[1] = 0x2B;                // Function code 43 (Encapsulated Interface Transport)
+  request[2] = 0x0E;                // MEI Type (Read Device Identification)
+  request[3] = 0x01;                // Read Device ID code (01 = Basic identification)
+  request[4] = 0x00;                // Object ID to start from (00 = VendorName)
+
+  // Calculate and append CRC
+  uint16_t crc = calculateCRC(request, 5);
+  request[5] = crc & 0xFF;          // CRC low byte
+  request[6] = (crc >> 8) & 0xFF;   // CRC high byte
+
+  // Clear input buffer
+  while (Serial1.available()) {
+    Serial1.read();
+  }
+
+  // Send request
+  Serial1.write(request, 7);
+  Serial1.flush();
+
+  logMsg = "Request sent: ";
+  for (int i = 0; i < 7; i++) {
+    if (request[i] < 0x10) logMsg += "0";
+    logMsg += String(request[i], HEX);
+    logMsg += " ";
+  }
+  logMsg += "\n\n";
+  Serial.print(logMsg);
+  logToWeb(logMsg);
+
+  // Wait for response
+  unsigned long startTime = millis();
+  while (Serial1.available() < 5 && (millis() - startTime) < MODBUS_TIMEOUT) {
+    delay(10);
+  }
+
+  if (Serial1.available() < 5) {
+    logMsg = "❌ No response from device\n";
+    logMsg += "This device likely doesn't support\n";
+    logMsg += "Modbus Device Identification (Function Code 43)\n";
+    logMsg += "========================================\n";
+    Serial.print(logMsg);
+    logToWeb(logMsg);
+    return;
+  }
+
+  // Read response
+  uint8_t response[256];
+  uint8_t bytesRead = 0;
+
+  while (Serial1.available() && bytesRead < 256) {
+    response[bytesRead++] = Serial1.read();
+    delay(1);  // Small delay to allow more bytes to arrive
+  }
+
+  logMsg = "Response received (" + String(bytesRead) + " bytes): ";
+  for (int i = 0; i < bytesRead; i++) {
+    if (response[i] < 0x10) logMsg += "0";
+    logMsg += String(response[i], HEX);
+    logMsg += " ";
+  }
+  logMsg += "\n\n";
+  Serial.print(logMsg);
+  logToWeb(logMsg);
+
+  // Check for exception response
+  if (response[1] == 0xAB) {  // Exception: 0x2B + 0x80
+    logMsg = "❌ Device returned Modbus exception!\n";
+    logMsg += "Exception code: 0x" + String(response[2], HEX) + "\n";
+    if (response[2] == 0x01) logMsg += "Reason: Illegal Function\n";
+    else if (response[2] == 0x02) logMsg += "Reason: Illegal Data Address\n";
+    else if (response[2] == 0x03) logMsg += "Reason: Illegal Data Value\n";
+    else if (response[2] == 0x04) logMsg += "Reason: Slave Device Failure\n";
+    logMsg += "\nThis device doesn't support Function Code 43\n";
+    logMsg += "========================================\n";
+    Serial.print(logMsg);
+    logToWeb(logMsg);
+    return;
+  }
+
+  // Verify response
+  if (response[0] != SLAVE_ID || response[1] != 0x2B || response[2] != 0x0E) {
+    logMsg = "❌ Invalid response format\n";
+    logMsg += "Expected: Slave=" + String(SLAVE_ID) + ", FC=0x2B, MEI=0x0E\n";
+    logMsg += "Received: Slave=" + String(response[0]) + ", FC=0x" + String(response[1], HEX) + ", MEI=0x" + String(response[2], HEX) + "\n";
+    logMsg += "========================================\n";
+    Serial.print(logMsg);
+    logToWeb(logMsg);
+    return;
+  }
+
+  // Parse device identification objects
+  logMsg = "✅ Device responded! Parsing identification...\n\n";
+  Serial.print(logMsg);
+  logToWeb(logMsg);
+
+  uint8_t readDeviceIdCode = response[3];
+  uint8_t conformityLevel = response[4];
+  uint8_t moreFollows = response[5];
+  uint8_t nextObjectId = response[6];
+  uint8_t numberOfObjects = response[7];
+
+  logMsg = "Conformity Level: ";
+  if (conformityLevel == 0x01) logMsg += "Basic";
+  else if (conformityLevel == 0x02) logMsg += "Regular";
+  else if (conformityLevel == 0x03) logMsg += "Extended";
+  else logMsg += "Unknown (" + String(conformityLevel) + ")";
+  logMsg += "\n";
+  logMsg += "Number of objects: " + String(numberOfObjects) + "\n";
+  logMsg += "More data follows: " + String(moreFollows ? "Yes" : "No") + "\n\n";
+  Serial.print(logMsg);
+  logToWeb(logMsg);
+
+  // Parse objects
+  int offset = 8;
+  for (int i = 0; i < numberOfObjects && offset < bytesRead - 2; i++) {
+    uint8_t objectId = response[offset++];
+    uint8_t objectLength = response[offset++];
+
+    String objectName = "";
+    switch (objectId) {
+      case 0x00: objectName = "VendorName"; break;
+      case 0x01: objectName = "ProductCode"; break;
+      case 0x02: objectName = "MajorMinorRevision"; break;
+      case 0x03: objectName = "VendorUrl"; break;
+      case 0x04: objectName = "ProductName"; break;
+      case 0x05: objectName = "ModelName"; break;
+      case 0x06: objectName = "UserApplicationName"; break;
+      default: objectName = "Unknown_0x" + String(objectId, HEX); break;
+    }
+
+    String objectValue = "";
+    for (int j = 0; j < objectLength && offset < bytesRead - 2; j++) {
+      objectValue += (char)response[offset++];
+    }
+
+    logMsg = "📋 " + objectName + ": " + objectValue + "\n";
+    Serial.print(logMsg);
+    logToWeb(logMsg);
+  }
+
+  logMsg = "\n========================================\n";
+  Serial.print(logMsg);
+  logToWeb(logMsg);
+}
+
+void handleWebServer() {
+  WiFiClient client = server.available();
+
+  if (client) {
+    String currentLine = "";
+
+    while (client.connected()) {
+      if (client.available()) {
+        char c = client.read();
+
+        if (c == '\n') {
+          // End of HTTP request
+          if (currentLine.length() == 0) {
+            // Send HTTP response
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html");
+            client.println("Connection: close");
+            client.println("Refresh: 5");  // Auto-refresh every 5 seconds
+            client.println();
+
+            // HTML page
+            client.println("<!DOCTYPE html><html><head>");
+            client.println("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+            client.println("<style>");
+            client.println("body{font-family:monospace;background:#1e1e1e;color:#d4d4d4;padding:20px;margin:0}");
+            client.println("h1{color:#4ec9b0;border-bottom:2px solid #4ec9b0;padding-bottom:10px}");
+            client.println(".info{background:#252526;padding:10px;border-left:4px solid #007acc;margin:10px 0}");
+            client.println(".log{background:#252526;padding:5px;margin:3px 0;border-left:2px solid #608b4e}");
+            client.println(".status{color:#4ec9b0;font-weight:bold}");
+            client.println("</style>");
+            client.println("</head><body>");
+
+            client.println("<h1>Y&H HSI 5000U Monitor</h1>");
+
+            client.println("<div class='info'>");
+            client.println("<span class='status'>Status:</span> Online<br>");
+            client.print("<span class='status'>Uptime:</span> ");
+            client.print(millis() / 1000);
+            client.println(" seconds<br>");
+            client.print("<span class='status'>IP:</span> ");
+            client.print(WiFi.localIP());
+            client.println("<br>");
+            client.print("<span class='status'>Total Logs:</span> ");
+            client.print(logCount);
+            client.println("</div>");
+
+            client.println("<h2>Recent Logs (Last " + String(min(logCount, MAX_LOG_ENTRIES)) + ")</h2>");
+
+            // Display logs in reverse order (newest first)
+            int startIdx = (logIndex - 1 + MAX_LOG_ENTRIES) % MAX_LOG_ENTRIES;
+            for (int i = 0; i < logCount; i++) {
+              int idx = (startIdx - i + MAX_LOG_ENTRIES) % MAX_LOG_ENTRIES;
+              client.println("<div class='log'>");
+              client.println(logBuffer[idx]);
+              client.println("</div>");
+            }
+
+            client.println("</body></html>");
+            client.println();
+            break;
+          } else {
+            currentLine = "";
+          }
+        } else if (c != '\r') {
+          currentLine += c;
+        }
+      }
+    }
+
+    client.stop();
+  }
 }
 
 void loop() {
   ArduinoCloud.update();
+
+  // Set deviceIP once when cloud is connected
+  if (!deviceIPSet && ArduinoCloud.connected() && WiFi.status() == WL_CONNECTED) {
+    deviceIP = "http://" + WiFi.localIP().toString();
+    deviceIPSet = true;
+    Serial.print("✅ Device IP set in cloud: ");
+    Serial.println(deviceIP);
+    logToWeb("Device IP published to cloud: " + deviceIP);
+  }
+
+  // Handle web server requests
+  handleWebServer();
+
+  // Your code here
+
+  float cur = (vcc / 2 - vcc * avg()) / sens;
+
+  keelPumpAmps = cur;
+
+  
   
   unsigned long currentMillis = millis();
   
@@ -513,8 +845,7 @@ void decodeBatteryBlock() {
   int16_t current = (int16_t)currentRaw;
   uint16_t pvVoltage = (responseBuffer[17] << 8) | responseBuffer[18];  // Register 7
   uint16_t pvCurrent = (responseBuffer[19] << 8) | responseBuffer[20];  // Register 8
-  
-  inverterData.batterySOC = soc;
+
   inverterData.batteryVoltage = voltage * 0.1;
   inverterData.batteryCurrent = current * 0.1;
   inverterData.pvVoltage = pvVoltage * 0.1;
@@ -555,8 +886,6 @@ void printInverterData() {
   
   // Battery
   Serial.print("🔋 BAT: ");
-  Serial.print(inverterData.batterySOC);
-  Serial.print("% @ ");
   Serial.print(inverterData.batteryVoltage, 1);
   Serial.print("V, ");
   Serial.print(abs(inverterData.batteryCurrent), 1);
@@ -580,7 +909,6 @@ void printInverterData() {
   
   // Update Arduino Cloud variables
   batteryVoltage = inverterData.batteryVoltage;
-  batterySOC = inverterData.batterySOC;
   batteryCurrent = inverterData.batteryCurrent;
   pvVoltage = inverterData.pvVoltage;
   pvCurrent = inverterData.pvCurrent;
@@ -592,24 +920,21 @@ void printInverterData() {
 void startParameterSnapshot() {
   if (scanState != SCAN_IDLE) {
     Serial.println("\n⚠️  Scan already in progress!");
+    logToWeb("\n⚠️  Scan already in progress!");
     return;
   }
-  
-  Serial.println("\n========================================");
-  Serial.println("📸 STARTING PARAMETER SNAPSHOT");
-  Serial.println("========================================");
-  Serial.println("Step 1: Scanning Y&H registers (~90 sec)");
-  Serial.println("Step 2: Re-scan to detect telemetry (~15 sec)");
-  Serial.println("Normal polling continues during scan.");
-  Serial.println("========================================\n");
-  
+
+  String msg = "\n========================================\n📸 STARTING PARAMETER SNAPSHOT\n========================================\nStep 1: Scanning Y&H registers (~90 sec)\nStep 2: Re-scan to detect telemetry (~15 sec)\nNormal polling continues during scan.\n========================================\n";
+  Serial.print(msg);
+  logToWeb(msg);
+
   scanState = SCAN_SNAPSHOTTING;
   currentRangeIndex = 0;
   currentRegisterIndex = 0;
   snapshotCount = 0;
   suppressScanErrors = true;
   lastScanTime = millis();
-  
+
   // Initialize isVolatile flags
   for (int i = 0; i < MAX_SNAPSHOT_REGS; i++) {
     paramSnapshot[i].isVolatile = false;
@@ -620,22 +945,21 @@ void startParameterSnapshot() {
 void startParameterCompare() {
   if (scanState != SCAN_IDLE) {
     Serial.println("\n⚠️  Scan already in progress!");
+    logToWeb("\n⚠️  Scan already in progress!");
     return;
   }
-  
+
   if (!snapshotTaken) {
-    Serial.println("\n❌ ERROR: No snapshot taken yet!");
-    Serial.println("Take a snapshot first by sending 'T'\n");
+    String msg = "\n❌ ERROR: No snapshot taken yet!\nTake a snapshot first by sending 'T'\n";
+    Serial.print(msg);
+    logToWeb(msg);
     return;
   }
-  
-  Serial.println("\n========================================");
-  Serial.println("🔍 COMPARING PARAMETERS TO SNAPSHOT");
-  Serial.println("========================================");
-  Serial.println("Re-reading all snapshot registers...");
-  Serial.println("This will take ~15 seconds.");
-  Serial.println("========================================\n");
-  
+
+  String msg = "\n========================================\n🔍 COMPARING PARAMETERS TO SNAPSHOT\n========================================\nRe-reading all snapshot registers...\nThis will take ~15 seconds.\n========================================\n";
+  Serial.print(msg);
+  logToWeb(msg);
+
   scanState = SCAN_COMPARING;
   currentRangeIndex = 0;
   suppressScanErrors = true;
@@ -654,15 +978,10 @@ void processScanStep() {
     // Snapshot mode: scan through all ranges
     if (currentRangeIndex >= numScanRanges) {
       // Done with first snapshot, now do baseline check
-      Serial.println("\n========================================");
-      Serial.println("✅ Step 1 complete: ");
-      Serial.print(snapshotCount);
-      Serial.println(" registers found");
-      Serial.println("========================================");
-      Serial.println("Step 2: Detecting telemetry registers...");
-      Serial.println("(waiting 5 seconds for values to change)");
-      Serial.println("========================================\n");
-      
+      String msg = "\n========================================\n✅ Step 1 complete: " + String(snapshotCount) + " registers found\n========================================\nStep 2: Detecting telemetry registers...\n(waiting 5 seconds for values to change)\n========================================\n";
+      Serial.print(msg);
+      logToWeb(msg);
+
       scanState = SCAN_BASELINE;
       currentRangeIndex = 0;
       lastScanTime = millis() + 5000;  // Wait 5 seconds before baseline
@@ -685,45 +1004,65 @@ void processScanStep() {
       if (endAddr < 0x10) Serial.print("0");
       Serial.print(endAddr, HEX);
       Serial.print(": ");
+
+      // Start new buffer for this range
+      String rangeStartStr = String(range->start, HEX);
+      while (rangeStartStr.length() < 4) rangeStartStr = "0" + rangeStartStr;
+      rangeStartStr.toUpperCase();
+      String rangeEndStr = String(endAddr, HEX);
+      while (rangeEndStr.length() < 4) rangeEndStr = "0" + rangeEndStr;
+      rangeEndStr.toUpperCase();
+      registerLogBuffer = "Range 0x" + rangeStartStr + "-0x" + rangeEndStr + ":\n";
     }
-    
+
     // Try to read one register
     uint16_t addr = range->start + currentRegisterIndex;
     int value = readSingleRegister(addr);
-    
+
     if (value >= 0 && snapshotCount < MAX_SNAPSHOT_REGS) {
       // Found a register!
       paramSnapshot[snapshotCount].address = addr;
       paramSnapshot[snapshotCount].value = value;
       snapshotCount++;
-      
+
       if (currentRegisterIndex == 0) Serial.println();  // Newline after range header
-      Serial.print("  ✓ 0x");
-      if (addr < 0x1000) Serial.print("0");
-      if (addr < 0x100) Serial.print("0");
-      if (addr < 0x10) Serial.print("0");
-      Serial.print(addr, HEX);
-      Serial.print(" = ");
-      Serial.println(value);
+
+      // Format address with leading zeros
+      String addrStr = String(addr, HEX);
+      while (addrStr.length() < 4) addrStr = "0" + addrStr;
+      addrStr.toUpperCase();
+
+      String msg = "  ✓ 0x" + addrStr + " = " + String(value);
+      Serial.println(msg);
+
+      // Add to buffer instead of sending immediately
+      registerLogBuffer += msg + "\n";
     }
-    
+
     // Move to next register
     currentRegisterIndex++;
     if (currentRegisterIndex >= range->count) {
-      // Done with this range, check if we found nothing
-      if (currentRegisterIndex == range->count) {
-        bool foundAny = false;
-        for (int i = 0; i < snapshotCount; i++) {
-          if (paramSnapshot[i].address >= range->start && 
-              paramSnapshot[i].address < range->start + range->count) {
-            foundAny = true;
-            break;
-          }
-        }
-        if (!foundAny && currentRegisterIndex > 0) {
-          Serial.println("none");
+      // Done with this range, check if we found any registers
+      bool foundAny = false;
+      for (int i = 0; i < snapshotCount; i++) {
+        if (paramSnapshot[i].address >= range->start &&
+            paramSnapshot[i].address < range->start + range->count) {
+          foundAny = true;
+          break;
         }
       }
+
+      if (!foundAny) {
+        Serial.println("none");
+        registerLogBuffer += "  (none)\n";
+      }
+
+      // Send accumulated buffer for this range to webhook
+      if (registerLogBuffer.length() > 0) {
+        logToWeb(registerLogBuffer);
+        registerLogBuffer = "";  // Clear buffer for next range
+      }
+
       currentRangeIndex++;
       currentRegisterIndex = 0;
     }
@@ -745,20 +1084,10 @@ void processScanStep() {
       scanState = SCAN_IDLE;
       suppressScanErrors = false;
       snapshotTaken = true;
-      
-      Serial.println("\n========================================");
-      Serial.println("✅ Snapshot complete!");
-      Serial.print("   Total registers: ");
-      Serial.println(snapshotCount);
-      Serial.print("   Stable (settings): ");
-      Serial.println(stableCount);
-      Serial.print("   Volatile (telemetry): ");
-      Serial.print(volatileCount);
-      Serial.println(" [ignored]");
-      Serial.println("========================================");
-      Serial.println("NOW: Change a setting on your inverter");
-      Serial.println("THEN: Send 'C' to compare");
-      Serial.println("========================================\n");
+
+      String msg = "\n========================================\n✅ Snapshot complete!\n   Total registers: " + String(snapshotCount) + "\n   Stable (settings): " + String(stableCount) + "\n   Volatile (telemetry): " + String(volatileCount) + " [ignored]\n========================================\nNOW: Change a setting on your inverter\nTHEN: Send 'C' to compare\n========================================\n";
+      Serial.print(msg);
+      logToWeb(msg);
       return;
     }
     
@@ -788,10 +1117,10 @@ void processScanStep() {
       // Done comparing
       scanState = SCAN_IDLE;
       suppressScanErrors = false;
-      
-      Serial.println("\n========================================");
-      Serial.println("✅ Comparison complete!");
-      Serial.println("========================================\n");
+
+      String msg = "\n========================================\n✅ Comparison complete!\n========================================\n";
+      Serial.print(msg);
+      logToWeb(msg);
       return;
     }
     
@@ -808,61 +1137,20 @@ void processScanStep() {
     
     if (newValue >= 0 && newValue != oldValue) {
       // Found a change in a stable register - this is a real settings change!
-      Serial.println("🎯 SETTING CHANGED!");
-      Serial.print("   Address: 0x");
-      if (addr < 0x1000) Serial.print("0");
-      if (addr < 0x100) Serial.print("0");
-      if (addr < 0x10) Serial.print("0");
-      Serial.print(addr, HEX);
-      Serial.print(" (");
-      Serial.print(addr);
-      Serial.println(")");
-      Serial.print("   Old: ");
-      Serial.print(oldValue);
-      Serial.print(" → New: ");
-      Serial.println(newValue);
-      Serial.println("   ⭐ WRITABLE SETTING REGISTER!\n");
+      // Format address with leading zeros
+      String addrStr = String(addr, HEX);
+      while (addrStr.length() < 4) addrStr = "0" + addrStr;
+      addrStr.toUpperCase();
+
+      String msg = "🎯 SETTING CHANGED!\n   Address: 0x" + addrStr + " (" + String(addr) + ")\n   Old: " + String(oldValue) + " → New: " + String(newValue) + "\n   ⭐ WRITABLE SETTING REGISTER!\n";
+      Serial.print(msg);
+      logToWeb(msg);
     }
     
     currentRangeIndex++;
   }
 }
 
-// Cloud callback: Buzzer control
-void onEnableBuzzerChange() {
-  Serial.println("\n========================================");
-  Serial.println("🔔 BUZZER CONTROL FROM CLOUD");
-  Serial.println("========================================");
-  
-  // The enableBuzzer variable contains the desired state
-  uint16_t desiredState = enableBuzzer ? 1 : 0;
-  
-  Serial.print("Cloud requested buzzer: ");
-  Serial.println(enableBuzzer ? "ON" : "OFF");
-  Serial.println("\nAttempting to write to register 0x138A...");
-  
-  if (writeModbusRegister(REG_BUZZER_ALARM, desiredState)) {
-    Serial.println("✅ Buzzer command sent successfully!");
-    Serial.println("🔊 Listen for a beep (or silence)!");
-    
-    // Verify the write
-    delay(500);
-    int verifyState = readSingleRegister(REG_BUZZER_ALARM);
-    if (verifyState == desiredState) {
-      Serial.println("✓ Verified: Register updated correctly!");
-    } else if (verifyState >= 0) {
-      Serial.print("⚠️  Register value: ");
-      Serial.print(verifyState);
-      Serial.println(" (unexpected)");
-    }
-  } else {
-    Serial.println("❌ Failed to write buzzer register");
-    Serial.println("Register 0x138A may not exist or be read-only");
-    Serial.println("Use snapshot/compare feature to find the real buzzer register!");
-  }
-  
-  Serial.println("========================================\n");
-}
 
 // Cloud callback: Take snapshot
 void onTakeSnapshotChange() {
@@ -879,3 +1167,17 @@ void onCompareSnapshotChange() {
     compareSnapshot = false;  // Reset the trigger
   }
 }
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
