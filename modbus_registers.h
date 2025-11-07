@@ -169,11 +169,19 @@
 // 0xE211: Inverter overload to bypass (parameter [27])
 
 // Charging Mode (parameter [06])
-// 0xE212: Charging priority
-//   0 = CSO (PV-Battery-Utility-Load)
-//   1 = CUB (PV-Utility-Battery-Load)
-//   2 = SNU (PV-Battery-Load, Solar first)
-//   3 = OSO (PV-Load-Battery-Utility)
+// 0xE212: Energy flow priority - controls how PV, utility, battery, and load interact
+//   0 = CSO (PV→Battery→Utility→Load)
+//       Maximize battery charge first, then utility supplements, finally power load
+//       Use when: Battery health/capacity is top priority
+//   1 = CUB (PV→Utility→Battery→Load) [DEFAULT]
+//       Balanced: Charge battery while ensuring load stays powered
+//       Use when: Want reliable power delivery with battery backup (most residential)
+//   2 = SNU (PV→Battery→Load, Solar first, NO utility charging)
+//       Solar powers load immediately, excess to battery, minimize grid usage
+//       Use when: Off-grid or want maximum solar utilization / minimal grid dependence
+//   3 = OSO (PV→Load→Battery→Utility)
+//       Direct solar-to-load delivery, battery charges from excess, utility backup only
+//       Use when: High-priority loads need immediate solar power / fastest response
 #define REG_CHARGING_MODE 0xE212
 
 // Battery Type (parameter [08])
